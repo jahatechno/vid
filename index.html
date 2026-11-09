@@ -206,19 +206,21 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
   async function ensureFFmpeg() {
     if (loaded) return;
     if (!window.FFmpegWASM || !window.FFmpegUtil) throw new Error('Could not load the converter files. Make sure the lib folder is uploaded next to index.html, and open the page over http(s), not as a local file.');
-    const { toBlobURL } = FFmpegUtil;
     ffmpeg = new FFmpegWASM.FFmpeg();
     ffmpeg.on('log', ({ message }) => logBuf.push(message));
     ffmpeg.on('progress', ({ progress }) => {
       if (progress >= 0 && progress <= 1) setBar(((curIndex + progress) / total) * 95);
     });
-    setStatus('Loading converter (about 30 MB, cached after the first time)…');
     const base = new URL('lib/', location.href).href;
-    await ffmpeg.load({
-      coreURL: await toBlobURL(`${base}ffmpeg-core.js`, 'text/javascript'),
-      wasmURL: await toBlobURL(`${base}ffmpeg-core.wasm`, 'application/wasm'),
-      classWorkerURL: await toBlobURL(`${base}814.ffmpeg.js`, 'text/javascript')
-    });
+    // Check the files really exist, so a wrong upload gives a clear message.
+    for (const f of ['ffmpeg-core.js', 'ffmpeg-core.wasm', '814.ffmpeg.js']) {
+      let r;
+      try { r = await fetch(base + f, { method: 'HEAD', cache: 'no-cache' }); } catch (e) { throw new Error(`Cannot reach ${base}${f}. Open the page over http(s), not as a local file.`); }
+      if (!r.ok || /text\/html/.test(r.headers.get('content-type') || '')) throw new Error(`Missing file: ${base}${f} (HTTP ${r.status}). Upload the lib folder next to index.html.`);
+    }
+    setStatus('Loading converter (about 30 MB, cached after the first time)…');
+    // Do not pass classWorkerURL: the UMD build must start its own worker (lib/814.ffmpeg.js).
+    await ffmpeg.load({ coreURL: base + 'ffmpeg-core.js', wasmURL: base + 'ffmpeg-core.wasm' });
     loaded = true;
   }
 
