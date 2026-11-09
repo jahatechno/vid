@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebM to MP4 Converter, Joiner & Cutter</title>
+<style>
+:root{color-scheme:light dark;--accent:#4776e6;--panel:rgba(127,127,127,.09);--line:color-mix(in srgb,CanvasText 18%,transparent)}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;font:16px/1.5 system-ui,Segoe UI,Arial,sans-serif;background:Canvas;color:CanvasText}
+header{padding:26px 16px;text-align:center;background:linear-gradient(120deg,#2447a8,#7c3aed);color:#fff}
+header h1{margin:0 0 6px;font-size:clamp(1.5rem,4vw,2.3rem)}
+header p{margin:0;opacity:.92}
+main{max-width:1000px;margin:22px auto;padding:0 16px 40px;display:grid;gap:16px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px;min-width:0}
+h2{margin:0 0 12px;font-size:1.1rem}
+button,select,input[type=text]{font:inherit;border-radius:10px;padding:9px 12px}
+button{border:0;cursor:pointer;background:var(--accent);color:#fff;font-weight:650}
+button.sec{background:color-mix(in srgb,CanvasText 12%,Canvas);color:CanvasText;border:1px solid var(--line)}
+button.danger{background:#c73535}
+button:disabled{opacity:.45;cursor:not-allowed}
+select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(--line)}
+.drop{border:2px dashed var(--line);border-radius:14px;padding:28px 16px;text-align:center;cursor:pointer}
+.drop.over{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent)}
+.small{font-size:.86rem;opacity:.8}
+#clips{display:grid;gap:12px;margin-top:14px}
+.clip{display:grid;grid-template-columns:minmax(0,260px) minmax(0,1fr);gap:14px;padding:12px;border:1px solid var(--line);border-radius:12px;background:Canvas}
+.clip video{width:100%;border-radius:8px;background:#111;max-height:180px}
+.clip h3{margin:0 0 6px;font-size:1rem;overflow-wrap:anywhere}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0}
+.row label{font-size:.9rem}
+.row input[type=text]{width:110px}
+.row button{padding:7px 10px;font-size:.88rem}
+.opts{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+.opts label{display:grid;gap:4px;font-size:.92rem}
+.bar{height:10px;border-radius:8px;background:var(--line);overflow:hidden;margin:12px 0}
+.bar span{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
+#status{font-size:.93rem;overflow-wrap:anywhere}
+#result video{width:100%;max-height:60vh;background:#111;border-radius:12px;margin-top:10px}
+@media(max-width:700px){.clip{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Video Converter &amp; Editor</h1>
+  <p>Convert WebM to MP4, join videos and cut parts out. Everything runs in your browser.</p>
+</header>
+<main>
+  <section>
+    <h2>1. Add videos</h2>
+    <div class="drop" id="drop" tabindex="0">Click here or drop video files (WebM, MP4, MOV, MKV…)<br><span class="small">Add several files to join them in order.</span></div>
+    <input type="file" id="file" accept="video/*,.webm,.mkv,.mov,.mp4" multiple hidden>
+    <div id="clips"></div>
+  </section>
+
+  <section>
+    <h2>2. Output settings</h2>
+    <div class="opts">
+      <label>Resolution
+        <select id="res"><option value="first">Same as first clip</option><option value="1080">1080p (1920×1080)</option><option value="720">720p (1280×720)</option><option value="480">480p (854×480)</option><option value="1080v">Vertical 1080×1920 (Reels/Shorts)</option></select>
+      </label>
+      <label>Quality / speed
+        <select id="qual"><option value="ultrafast,28">Fast, smaller file</option><option value="veryfast,23" selected>Balanced</option><option value="medium,20">Best quality (slower)</option></select>
+      </label>
+    </div>
+    <p class="small">Each clip is converted to H.264 + AAC (works on YouTube, Facebook, Instagram, TikTok), then all clips are joined. Browser memory limits large files: if a file is over about 1 GB, cut it into parts first.</p>
+  </section>
+
+  <section>
+    <h2>3. Create MP4</h2>
+    <div class="row">
+      <button id="go" disabled>Create MP4</button>
+      <button id="cancel" class="danger" hidden>Cancel</button>
+    </div>
+    <div class="bar"><span id="fill"></span></div>
+    <div id="status" role="status" aria-live="polite">Add at least one video to begin.</div>
+    <div id="result" hidden>
+      <video id="out" controls playsinline></video>
+      <div class="row"><button id="dl">Download MP4</button><span class="small" id="outInfo"></span></div>
+    </div>
+  </section>
+</main>
+
+<script src="lib/ffmpeg.js"></script>
+<script src="lib/util.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const clipsEl = $('clips'), statusEl = $('status'), goBtn = $('go'), cancelBtn = $('cancel');
+  let clips = [], nextId = 1, ffmpeg = null, loaded = false, busy = false, outUrl = null, outName = 'output.mp4';
+  let logBuf = [], curIndex = 0, total = 1;
+
+  const setStatus = t => statusEl.textContent = t;
+  const setBar = p => $('fill').style.width = Math.max(0, Math.min(100, p)) + '%';
+  const fmt = s => {
+    s = Math.max(0, s || 0);
+    const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = (s % 60).toFixed(1).padStart(4, '0');
+    return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + sec;
+  };
+  const parse = str => {
+    const parts = String(str).trim().split(':').map(Number);
+    if (!parts.length || parts.some(isNaN)) return NaN;
+    return parts.reduce((a, v) => a * 60 + v, 0);
+  };
+  const totalDur = () => clips.reduce((a, c) => a + (c.end - c.start), 0);
+
+  // WebM files from screen recorders often report an infinite duration. This forces the real value.
+  function fixDuration(v) {
+    if (isFinite(v.duration)) return;
+    const onTime = () => { v.removeEventListener('timeupdate', onTime); v.currentTime = 0; };
+    v.addEventListener('timeupdate', onTime);
+    v.currentTime = 1e101;
+  }
+  function readMeta(url) {
+    return new Promise((res, rej) => {
+      const v = document.createElement('video');
+      v.preload = 'metadata'; v.muted = true; v.src = url;
+      v.onerror = () => rej(new Error('Cannot read this video file.'));
+      v.onloadedmetadata = () => {
+        const done = () => res({ d: v.duration, w: v.videoWidth, h: v.videoHeight });
+        if (isFinite(v.duration)) return done();
+        v.ontimeupdate = () => { v.ontimeupdate = null; done(); };
+        v.currentTime = 1e101;
+      };
+    });
+  }
+
+  async function addFiles(files) {
+    for (const file of files) {
+      if (!file.type.startsWith('video/') && !/\.(webm|mkv|mov|mp4|avi|m4v)$/i.test(file.name)) continue;
+      const url = URL.createObjectURL(file);
+      try {
+        const m = await readMeta(url);
+        clips.push({ id: nextId++, file, url, dur: m.d, w: m.w, h: m.h, start: 0, end: m.d });
+      } catch (e) { setStatus(`${file.name}: ${e.message}`); URL.revokeObjectURL(url); }
+    }
+    render();
+  }
+
+  function render() {
+    clipsEl.innerHTML = '';
+    clips.forEach((c, i) => {
+      const card = document.createElement('div'); card.className = 'clip';
+      const v = document.createElement('video'); v.src = c.url; v.controls = true; v.preload = 'metadata'; v.playsInline = true;
+      v.addEventListener('loadedmetadata', () => fixDuration(v));
+      const info = document.createElement('div');
+      const h = document.createElement('h3'); h.textContent = `${i + 1}. ${c.file.name}`;
+      const meta = document.createElement('div'); meta.className = 'small';
+      const keep = document.createElement('span');
+      const upd = () => { keep.textContent = `Keeps ${fmt(c.end - c.start)} of ${fmt(c.dur)}`; refresh(); };
+      meta.textContent = `${(c.file.size / 1048576).toFixed(1)} MB • ${c.w}×${c.h} • `;
+      meta.append(keep);
+
+      const mk = (text, cls, fn) => { const b = document.createElement('button'); b.textContent = text; if (cls) b.className = cls; b.addEventListener('click', fn); return b; };
+      const sIn = document.createElement('input'); sIn.type = 'text'; sIn.value = fmt(c.start); sIn.setAttribute('aria-label', 'Start time');
+      const eIn = document.createElement('input'); eIn.type = 'text'; eIn.value = fmt(c.end); eIn.setAttribute('aria-label', 'End time');
+      const commit = () => {
+        let s = parse(sIn.value), e = parse(eIn.value);
+        if (isNaN(s)) s = c.start; if (isNaN(e)) e = c.end;
+        s = Math.max(0, Math.min(s, c.dur)); e = Math.max(0, Math.min(e, c.dur));
+        if (e - s < 0.2) { setStatus('End must be after start.'); s = c.start; e = c.end; }
+        c.start = s; c.end = e; sIn.value = fmt(s); eIn.value = fmt(e); upd();
+      };
+      sIn.addEventListener('change', commit); eIn.addEventListener('change', commit);
+
+      const r1 = document.createElement('div'); r1.className = 'row';
+      const l1 = document.createElement('label'); l1.append('Start ', sIn);
+      const l2 = document.createElement('label'); l2.append('End ', eIn);
+      r1.append(l1, mk('Start = player time', 'sec', () => { sIn.value = fmt(v.currentTime); commit(); }), l2, mk('End = player time', 'sec', () => { eIn.value = fmt(v.currentTime); commit(); }));
+
+      const r2 = document.createElement('div'); r2.className = 'row';
+      r2.append(
+        mk('Split here', 'sec', () => {
+          const t = v.currentTime;
+          if (t <= c.start + 0.2 || t >= c.end - 0.2) { setStatus('Move the player inside the kept part, then press Split here.'); return; }
+          const b = { ...c, id: nextId++, start: t };
+          c.end = t; clips.splice(i + 1, 0, b); render();
+          setStatus('Clip split in two. Delete or trim one part to cut that portion out.');
+        }),
+        mk('Reset', 'sec', () => { c.start = 0; c.end = c.dur; sIn.value = fmt(0); eIn.value = fmt(c.dur); upd(); }),
+        mk('↑', 'sec', () => { if (i > 0) { [clips[i - 1], clips[i]] = [clips[i], clips[i - 1]]; render(); } }),
+        mk('↓', 'sec', () => { if (i < clips.length - 1) { [clips[i + 1], clips[i]] = [clips[i], clips[i + 1]]; render(); } }),
+        mk('Remove', 'danger', () => { clips.splice(i, 1); if (!clips.some(x => x.url === c.url)) URL.revokeObjectURL(c.url); render(); })
+      );
+      info.append(h, meta, r1, r2);
+      card.append(v, info); clipsEl.append(card);
+      upd();
+    });
+    refresh();
+  }
+
+  function refresh() {
+    goBtn.disabled = busy || !clips.length;
+    if (!busy) setStatus(clips.length ? `${clips.length} clip(s) ready • output length ${fmt(totalDur())}` : 'Add at least one video to begin.');
+  }
+
+  const drop = $('drop'), fileIn = $('file');
+  drop.addEventListener('click', () => fileIn.click());
+  drop.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileIn.click(); } });
+  fileIn.addEventListener('change', () => { addFiles([...fileIn.files]); fileIn.value = ''; });
+  ['dragover', 'dragenter'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+  drop.addEventListener('drop', e => addFiles([...e.dataTransfer.files]));
+
+  async function ensureFFmpeg() {
+    if (loaded) return;
+    if (!window.FFmpegWASM || !window.FFmpegUtil) throw new Error('Could not load the converter files. Make sure the lib folder is uploaded next to index.html, and open the page over http(s), not as a local file.');
+    const { toBlobURL } = FFmpegUtil;
+    ffmpeg = new FFmpegWASM.FFmpeg();
+    ffmpeg.on('log', ({ message }) => logBuf.push(message));
+    ffmpeg.on('progress', ({ progress }) => {
+      if (progress >= 0 && progress <= 1) setBar(((curIndex + progress) / total) * 95);
+    });
+    setStatus('Loading converter (about 30 MB, cached after the first time)…');
+    const base = new URL('lib/', location.href).href;
+    await ffmpeg.load({
+      coreURL: await toBlobURL(`${base}ffmpeg-core.js`, 'text/javascript'),
+      wasmURL: await toBlobURL(`${base}ffmpeg-core.wasm`, 'application/wasm'),
+      classWorkerURL: await toBlobURL(`${base}814.ffmpeg.js`, 'text/javascript')
+    });
+    loaded = true;
+  }
+
+  async function hasAudio(name) {
+    logBuf = [];
+    try { await ffmpeg.exec(['-i', name]); } catch (e) {}
+    return logBuf.some(l => /Stream #.*Audio/.test(l));
+  }
+
+  goBtn.addEventListener('click', async () => {
+    if (busy || !clips.length) return;
+    busy = true; goBtn.disabled = true; cancelBtn.hidden = false; $('result').hidden = true; setBar(0);
+    try {
+      await ensureFFmpeg();
+      const resVal = $('res').value;
+      let W, H;
+      if (resVal === 'first') { W = clips[0].w; H = clips[0].h; }
+      else if (resVal === '1080v') { W = 1080; H = 1920; }
+      else { H = Number(resVal); W = Math.round(H * 16 / 9); }
+      W -= W % 2; H -= H % 2;
+      const [preset, crf] = $('qual').value.split(',');
+      total = clips.length;
+      const vf = `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p`;
+      let list = '';
+      for (let i = 0; i < clips.length; i++) {
+        curIndex = i;
+        const c = clips[i];
+        const ext = (c.file.name.match(/\.[a-z0-9]+$/i) || ['.webm'])[0];
+        const inName = `in${i}${ext}`, outName_i = `c${i}.mp4`;
+        setStatus(`Processing clip ${i + 1} of ${clips.length}…`);
+        await ffmpeg.writeFile(inName, await FFmpegUtil.fetchFile(c.file));
+        const audio = await hasAudio(inName);
+        const dur = (c.end - c.start).toFixed(3);
+        const args = ['-ss', c.start.toFixed(3), '-i', inName];
+        if (!audio) args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo');
+        args.push('-t', dur, '-map', '0:v:0', '-map', audio ? '0:a:0' : '1:a:0',
+          '-vf', vf, '-c:v', 'libx264', '-preset', preset, '-crf', crf,
+          '-c:a', 'aac', '-b:a', '160k', '-ar', '44100', '-ac', '2', '-af', 'aresample=async=1',
+          '-movflags', '+faststart', outName_i);
+        const code = await ffmpeg.exec(args);
+        await ffmpeg.deleteFile(inName).catch(() => {});
+        if (code !== 0) throw new Error(`Clip ${i + 1} failed to convert.`);
+        list += `file '${outName_i}'\n`;
+      }
+      setStatus('Joining clips…'); setBar(96);
+      await ffmpeg.writeFile('list.txt', list);
+      const code = await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', '-movflags', '+faststart', 'output.mp4']);
+      if (code !== 0) throw new Error('Joining the clips failed.');
+      const data = await ffmpeg.readFile('output.mp4');
+      for (let i = 0; i < clips.length; i++) await ffmpeg.deleteFile(`c${i}.mp4`).catch(() => {});
+      await ffmpeg.deleteFile('output.mp4').catch(() => {});
+      await ffmpeg.deleteFile('list.txt').catch(() => {});
+      if (outUrl) URL.revokeObjectURL(outUrl);
+      const blob = new Blob([data.buffer], { type: 'video/mp4' });
+      outUrl = URL.createObjectURL(blob);
+      const base = clips[0].file.name.replace(/\.[^.]+$/, '');
+      outName = clips.length > 1 || clips[0].start > 0 || clips[0].end < clips[0].dur ? `${base}-edited.mp4` : `${base}.mp4`;
+      $('out').src = outUrl; $('result').hidden = false;
+      $('outInfo').textContent = `${outName} • ${(blob.size / 1048576).toFixed(1)} MB • ${W}×${H}`;
+      setBar(100); setStatus('Done! Preview your MP4 below, then download it.');
+    } catch (err) {
+      setStatus(`Error: ${err.message || err}. For big files, try 480p or 720p, or cut the video into smaller parts.`);
+      setBar(0);
+    } finally {
+      busy = false; cancelBtn.hidden = true; goBtn.disabled = !clips.length;
+    }
+  });
+
+  cancelBtn.addEventListener('click', () => {
+    if (ffmpeg && busy) { ffmpeg.terminate(); loaded = false; ffmpeg = null; setStatus('Cancelled. You can start again.'); setBar(0); }
+  });
+
+  $('dl').addEventListener('click', () => {
+    if (!outUrl) return;
+    const a = document.createElement('a'); a.href = outUrl; a.download = outName; document.body.appendChild(a); a.click(); a.remove();
+  });
+})();
+</script>
+</body>
+</html>
