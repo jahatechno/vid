@@ -37,6 +37,11 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
 .bar{height:10px;border-radius:8px;background:var(--line);overflow:hidden;margin:12px 0}
 .bar span{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
 #status{font-size:.93rem;overflow-wrap:anywhere}
+#jobs{display:grid;gap:12px;margin-top:14px}
+.job{border:1px solid var(--line);border-radius:12px;padding:12px;background:Canvas}
+.job h3{margin:0 0 4px;font-size:1rem;overflow-wrap:anywhere}
+.job .st{font-size:.9rem;overflow-wrap:anywhere}
+.job video{width:100%;max-height:50vh;background:#111;border-radius:10px;margin-top:10px}
 #result video{width:100%;max-height:60vh;background:#111;border-radius:12px;margin-top:10px}
 @media(max-width:700px){.clip{grid-template-columns:1fr}}
 </style>
@@ -69,16 +74,10 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
 
   <section>
     <h2>3. Create MP4</h2>
-    <div class="row">
-      <button id="go" disabled>Create MP4</button>
-      <button id="cancel" class="danger" hidden>Cancel</button>
-    </div>
-    <div class="bar"><span id="fill"></span></div>
+    <div class="row"><button id="go" disabled>Add to queue &amp; create MP4</button></div>
     <div id="status" role="status" aria-live="polite">Add at least one video to begin.</div>
-    <div id="result" hidden>
-      <video id="out" controls playsinline></video>
-      <div class="row"><button id="dl">Download MP4</button><span class="small" id="outInfo"></span></div>
-    </div>
+    <p class="small">Your videos never leave your device: every visitor runs a private copy of the converter in their own browser, so many people can use this page at the same time. You can queue several jobs; they run one after another.</p>
+    <div id="jobs"></div>
   </section>
 </main>
 
@@ -87,12 +86,11 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
 <script>
 (() => {
   const $ = id => document.getElementById(id);
-  const clipsEl = $('clips'), statusEl = $('status'), goBtn = $('go'), cancelBtn = $('cancel');
-  let clips = [], nextId = 1, ffmpeg = null, loaded = false, busy = false, outUrl = null, outName = 'output.mp4';
-  let logBuf = [], curIndex = 0, total = 1;
+  const clipsEl = $('clips'), statusEl = $('status'), goBtn = $('go'), jobsEl = $('jobs');
+  let clips = [], nextId = 1, ffmpeg = null, loaded = false, loading = null;
+  let logBuf = [], activeJob = null, queueTail = Promise.resolve(), jobSeq = 0;
 
   const setStatus = t => statusEl.textContent = t;
-  const setBar = p => $('fill').style.width = Math.max(0, Math.min(100, p)) + '%';
   const fmt = s => {
     s = Math.max(0, s || 0);
     const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = (s % 60).toFixed(1).padStart(4, '0');
@@ -191,8 +189,8 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
   }
 
   function refresh() {
-    goBtn.disabled = busy || !clips.length;
-    if (!busy) setStatus(clips.length ? `${clips.length} clip(s) ready • output length ${fmt(totalDur())}` : 'Add at least one video to begin.');
+    goBtn.disabled = !clips.length;
+    setStatus(clips.length ? `${clips.length} clip(s) ready • output length ${fmt(totalDur())}` : 'Add at least one video to begin.');
   }
 
   const drop = $('drop'), fileIn = $('file');
@@ -203,13 +201,18 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
   ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
   drop.addEventListener('drop', e => addFiles([...e.dataTransfer.files]));
 
-  async function ensureFFmpeg() {
+  function ensureFFmpeg() {
+    if (loaded) return Promise.resolve();
+    if (!loading) loading = loadEngine().finally(() => { loading = null; });
+    return loading;
+  }
+  async function loadEngine() {
     if (loaded) return;
     if (!window.FFmpegWASM || !window.FFmpegUtil) throw new Error('Could not load the converter files. Make sure the lib folder is uploaded next to index.html, and open the page over http(s), not as a local file.');
     ffmpeg = new FFmpegWASM.FFmpeg();
     ffmpeg.on('log', ({ message }) => logBuf.push(message));
     ffmpeg.on('progress', ({ progress }) => {
-      if (progress >= 0 && progress <= 1) setBar(((curIndex + progress) / total) * 95);
+      if (activeJob && progress >= 0 && progress <= 1) activeJob.setPct(((activeJob.cur + progress) / activeJob.clips.length) * 95);
     });
     const base = new URL('lib/', location.href).href;
     // Check the files really exist, so a wrong upload gives a clear message.
@@ -230,73 +233,117 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
     return logBuf.some(l => /Stream #.*Audio/.test(l));
   }
 
-  goBtn.addEventListener('click', async () => {
-    if (busy || !clips.length) return;
-    busy = true; goBtn.disabled = true; cancelBtn.hidden = false; $('result').hidden = true; setBar(0);
+  // ---------- Job queue: each job has its own state, UI card and file names ----------
+  function makeJobCard(job) {
+    const el = document.createElement('div'); el.className = 'job';
+    const h = document.createElement('h3'); h.textContent = job.label;
+    const st = document.createElement('div'); st.className = 'st';
+    const bar = document.createElement('div'); bar.className = 'bar'; const fill = document.createElement('span'); bar.append(fill);
+    const row = document.createElement('div'); row.className = 'row';
+    const cancel = document.createElement('button'); cancel.className = 'danger'; cancel.textContent = 'Cancel';
+    row.append(cancel);
+    const res = document.createElement('div'); res.hidden = true;
+    el.append(h, st, bar, row, res);
+    jobsEl.prepend(el);
+    cancel.addEventListener('click', () => {
+      job.cancelled = true;
+      if (activeJob === job && ffmpeg) { ffmpeg.terminate(); loaded = false; ffmpeg = null; }
+      else st.textContent = 'Cancelled.';
+      cancel.hidden = true;
+    });
+    job.setText = t => st.textContent = t;
+    job.setPct = p => fill.style.width = Math.max(0, Math.min(100, p)) + '%';
+    job.finish = (blob, name, info) => {
+      cancel.hidden = true; job.setPct(100); job.setText('Done! Preview your MP4, then download it.');
+      const url = URL.createObjectURL(blob);
+      const v = document.createElement('video'); v.src = url; v.controls = true; v.playsInline = true;
+      const r = document.createElement('div'); r.className = 'row';
+      const dl = document.createElement('button'); dl.textContent = 'Download MP4';
+      dl.addEventListener('click', () => { const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove(); });
+      const rm = document.createElement('button'); rm.className = 'sec'; rm.textContent = 'Remove';
+      rm.addEventListener('click', () => { URL.revokeObjectURL(url); el.remove(); });
+      const inf = document.createElement('span'); inf.className = 'small'; inf.textContent = `${name} • ${info}`;
+      r.append(dl, rm, inf); res.append(v, r); res.hidden = false;
+    };
+    job.fail = msg => { cancel.hidden = true; job.setPct(0); job.setText(msg); };
+    job.setText('Waiting in queue…');
+  }
+
+  async function runJob(job) {
+    if (job.cancelled) { job.fail('Cancelled.'); return; }
+    activeJob = job;
+    const names = [];
+    const rm = async n => { try { await ffmpeg.deleteFile(n); } catch (e) {} };
     try {
+      job.setText('Starting…');
       await ensureFFmpeg();
-      const resVal = $('res').value;
       let W, H;
-      if (resVal === 'first') { W = clips[0].w; H = clips[0].h; }
-      else if (resVal === '1080v') { W = 1080; H = 1920; }
-      else { H = Number(resVal); W = Math.round(H * 16 / 9); }
+      if (job.res === 'first') { W = job.clips[0].w; H = job.clips[0].h; }
+      else if (job.res === '1080v') { W = 1080; H = 1920; }
+      else { H = Number(job.res); W = Math.round(H * 16 / 9); }
       W -= W % 2; H -= H % 2;
-      const [preset, crf] = $('qual').value.split(',');
-      total = clips.length;
       const vf = `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p`;
       let list = '';
-      for (let i = 0; i < clips.length; i++) {
-        curIndex = i;
-        const c = clips[i];
+      for (let i = 0; i < job.clips.length; i++) {
+        if (job.cancelled) throw new Error('Cancelled.');
+        job.cur = i;
+        const c = job.clips[i];
         const ext = (c.file.name.match(/\.[a-z0-9]+$/i) || ['.webm'])[0];
-        const inName = `in${i}${ext}`, outName_i = `c${i}.mp4`;
-        setStatus(`Processing clip ${i + 1} of ${clips.length}…`);
+        const inName = `j${job.id}_in${i}${ext}`, clipOut = `j${job.id}_c${i}.mp4`;
+        names.push(inName, clipOut);
+        job.setText(`Processing clip ${i + 1} of ${job.clips.length}…`);
         await ffmpeg.writeFile(inName, await FFmpegUtil.fetchFile(c.file));
         const audio = await hasAudio(inName);
-        const dur = (c.end - c.start).toFixed(3);
         const args = ['-ss', c.start.toFixed(3), '-i', inName];
         if (!audio) args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo');
-        args.push('-t', dur, '-map', '0:v:0', '-map', audio ? '0:a:0' : '1:a:0',
-          '-vf', vf, '-c:v', 'libx264', '-preset', preset, '-crf', crf,
+        args.push('-t', (c.end - c.start).toFixed(3), '-map', '0:v:0', '-map', audio ? '0:a:0' : '1:a:0',
+          '-vf', vf, '-c:v', 'libx264', '-preset', job.preset, '-crf', job.crf,
           '-c:a', 'aac', '-b:a', '160k', '-ar', '44100', '-ac', '2', '-af', 'aresample=async=1',
-          '-movflags', '+faststart', outName_i);
+          '-movflags', '+faststart', clipOut);
         const code = await ffmpeg.exec(args);
-        await ffmpeg.deleteFile(inName).catch(() => {});
+        await rm(inName);
         if (code !== 0) throw new Error(`Clip ${i + 1} failed to convert.`);
-        list += `file '${outName_i}'\n`;
+        list += `file '${clipOut}'\n`;
       }
-      setStatus('Joining clips…'); setBar(96);
-      await ffmpeg.writeFile('list.txt', list);
-      const code = await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', '-movflags', '+faststart', 'output.mp4']);
+      job.setText('Joining clips…'); job.setPct(96);
+      const listName = `j${job.id}_list.txt`, outFile = `j${job.id}_out.mp4`;
+      names.push(listName, outFile);
+      await ffmpeg.writeFile(listName, list);
+      const code = await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', listName, '-c', 'copy', '-movflags', '+faststart', outFile]);
       if (code !== 0) throw new Error('Joining the clips failed.');
-      const data = await ffmpeg.readFile('output.mp4');
-      for (let i = 0; i < clips.length; i++) await ffmpeg.deleteFile(`c${i}.mp4`).catch(() => {});
-      await ffmpeg.deleteFile('output.mp4').catch(() => {});
-      await ffmpeg.deleteFile('list.txt').catch(() => {});
-      if (outUrl) URL.revokeObjectURL(outUrl);
+      const data = await ffmpeg.readFile(outFile);
       const blob = new Blob([data.buffer], { type: 'video/mp4' });
-      outUrl = URL.createObjectURL(blob);
-      const base = clips[0].file.name.replace(/\.[^.]+$/, '');
-      outName = clips.length > 1 || clips[0].start > 0 || clips[0].end < clips[0].dur ? `${base}-edited.mp4` : `${base}.mp4`;
-      $('out').src = outUrl; $('result').hidden = false;
-      $('outInfo').textContent = `${outName} • ${(blob.size / 1048576).toFixed(1)} MB • ${W}×${H}`;
-      setBar(100); setStatus('Done! Preview your MP4 below, then download it.');
+      const f = job.clips[0], base = f.file.name.replace(/\.[^.]+$/, '');
+      const edited = job.clips.length > 1 || f.start > 0 || f.end < f.dur;
+      job.finish(blob, edited ? `${base}-edited.mp4` : `${base}.mp4`, `${(blob.size / 1048576).toFixed(1)} MB • ${W}×${H}`);
     } catch (err) {
-      setStatus(`Error: ${err.message || err}. For big files, try 480p or 720p, or cut the video into smaller parts.`);
-      setBar(0);
+      job.fail(job.cancelled ? 'Cancelled.' : `Error: ${err.message || err}. For big files, try 480p or 720p, or cut the video into smaller parts.`);
     } finally {
-      busy = false; cancelBtn.hidden = true; goBtn.disabled = !clips.length;
+      if (ffmpeg && loaded) for (const n of names) await rm(n);
+      activeJob = null;
     }
-  });
+  }
 
-  cancelBtn.addEventListener('click', () => {
-    if (ffmpeg && busy) { ffmpeg.terminate(); loaded = false; ffmpeg = null; setStatus('Cancelled. You can start again.'); setBar(0); }
-  });
+  function enqueue() {
+    if (!clips.length) return;
+    const [preset, crf] = $('qual').value.split(',');
+    const job = {
+      id: ++jobSeq, cancelled: false, cur: 0, preset, crf, res: $('res').value,
+      clips: clips.map(c => ({ file: c.file, start: c.start, end: c.end, dur: c.dur, w: c.w, h: c.h }))
+    };
+    job.label = `Job ${job.id}: ${job.clips.length} clip(s), ${fmt(job.clips.reduce((a, c) => a + c.end - c.start, 0))}`;
+    makeJobCard(job);
+    queueTail = queueTail.then(() => runJob(job));   // jobs run one after another
+    // Free the editor so the next task can be prepared while this one converts.
+    clips.forEach(c => URL.revokeObjectURL(c.url));
+    clips = [];
+    render();
+    setStatus(`Job ${job.id} added to the queue. You can prepare another one.`);
+  }
+  goBtn.addEventListener('click', enqueue);
 
-  $('dl').addEventListener('click', () => {
-    if (!outUrl) return;
-    const a = document.createElement('a'); a.href = outUrl; a.download = outName; document.body.appendChild(a); a.click(); a.remove();
-  });
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+
 })();
 </script>
 </body>
