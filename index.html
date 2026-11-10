@@ -54,6 +54,10 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
 <main>
   <section>
     <h2>1. Add videos</h2>
+    <div class="row">
+      <label><input type="checkbox" id="autoSplit" checked> Auto-split long videos into parts of</label>
+      <input type="text" id="splitLen" value="60" style="width:70px" aria-label="Part length in seconds"> <span class="small">seconds (60 = 1 minute)</span>
+    </div>
     <div class="drop" id="drop" tabindex="0">Click here or drop video files (WebM, MP4, MOV, MKV…)<br><span class="small">Add several files to join them in order.</span></div>
     <input type="file" id="file" accept="video/*,.webm,.mkv,.mov,.mp4" multiple hidden>
     <div id="clips"></div>
@@ -64,6 +68,9 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
     <div class="opts">
       <label>Resolution
         <select id="res"><option value="first">Same as first clip</option><option value="1080">1080p (1920×1080)</option><option value="720">720p (1280×720)</option><option value="480">480p (854×480)</option><option value="1080v">Vertical 1080×1920 (Reels/Shorts)</option></select>
+      </label>
+      <label>Output
+        <select id="mode"><option value="join">Join all clips into one MP4</option><option value="separate">Save each clip as its own MP4</option></select>
       </label>
       <label>Quality / speed
         <select id="qual"><option value="ultrafast,28">Fast, smaller file</option><option value="veryfast,23" selected>Balanced</option><option value="medium,20">Best quality (slower)</option></select>
@@ -104,9 +111,9 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
   const totalDur = () => clips.reduce((a, c) => a + (c.end - c.start), 0);
 
   // WebM files from screen recorders often report an infinite duration. This forces the real value.
-  function fixDuration(v) {
-    if (isFinite(v.duration)) return;
-    const onTime = () => { v.removeEventListener('timeupdate', onTime); v.currentTime = 0; };
+  function fixDuration(v, cb) {
+    if (isFinite(v.duration)) { if (cb) cb(); return; }
+    const onTime = () => { v.removeEventListener('timeupdate', onTime); v.currentTime = 0; if (cb) cb(); };
     v.addEventListener('timeupdate', onTime);
     v.currentTime = 1e101;
   }
@@ -124,13 +131,24 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
     });
   }
 
+  // Cuts a long video into back-to-back parts (0–1:00, 1:00–2:00, …) with no gaps and no overlap.
+  function segmentsFor(d) {
+    const L = Math.max(5, parseFloat($('splitLen').value) || 60);
+    if (!$('autoSplit').checked || d <= L + 0.5) return [[0, d]];
+    const out = [];
+    for (let t = 0; t < d - 0.5; t += L) out.push([t, Math.min(t + L, d)]);
+    if (out.length > 1 && out[out.length - 1][1] - out[out.length - 1][0] < 1) { out.pop(); out[out.length - 1][1] = d; }
+    return out;
+  }
   async function addFiles(files) {
     for (const file of files) {
       if (!file.type.startsWith('video/') && !/\.(webm|mkv|mov|mp4|avi|m4v)$/i.test(file.name)) continue;
       const url = URL.createObjectURL(file);
       try {
         const m = await readMeta(url);
-        clips.push({ id: nextId++, file, url, dur: m.d, w: m.w, h: m.h, start: 0, end: m.d });
+        const parts = segmentsFor(m.d);
+        parts.forEach(([a, b]) => clips.push({ id: nextId++, file, url, dur: m.d, w: m.w, h: m.h, start: a, end: b }));
+        if (parts.length > 1) setStatus(`${file.name} was split into ${parts.length} parts. Choose "Save each clip as its own MP4" to get them as separate files.`);
       } catch (e) { setStatus(`${file.name}: ${e.message}`); URL.revokeObjectURL(url); }
     }
     render();
@@ -140,8 +158,8 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
     clipsEl.innerHTML = '';
     clips.forEach((c, i) => {
       const card = document.createElement('div'); card.className = 'clip';
-      const v = document.createElement('video'); v.src = c.url; v.controls = true; v.preload = 'metadata'; v.playsInline = true;
-      v.addEventListener('loadedmetadata', () => fixDuration(v));
+      const v = document.createElement('video'); v.src = c.url; v.controls = true; v.preload = i < 8 ? 'metadata' : 'none'; v.playsInline = true;
+      v.addEventListener('loadedmetadata', () => fixDuration(v, () => { if (c.start > 0) v.currentTime = c.start; }));
       const info = document.createElement('div');
       const h = document.createElement('h3'); h.textContent = `${i + 1}. ${c.file.name}`;
       const meta = document.createElement('div'); meta.className = 'small';
@@ -234,6 +252,7 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
   }
 
   // ---------- Job queue: each job has its own state, UI card and file names ----------
+  function saveUrl(url, name) { const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove(); }
   function makeJobCard(job) {
     const el = document.createElement('div'); el.className = 'job';
     const h = document.createElement('h3'); h.textContent = job.label;
@@ -253,17 +272,28 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
     });
     job.setText = t => st.textContent = t;
     job.setPct = p => fill.style.width = Math.max(0, Math.min(100, p)) + '%';
-    job.finish = (blob, name, info) => {
-      cancel.hidden = true; job.setPct(100); job.setText('Done! Preview your MP4, then download it.');
-      const url = URL.createObjectURL(blob);
-      const v = document.createElement('video'); v.src = url; v.controls = true; v.playsInline = true;
+    const results = [];
+    job.addResult = (blob, name, info) => {
+      const url = URL.createObjectURL(blob); results.push({ url, name });
+      const item = document.createElement('div'); item.style.marginTop = '10px';
+      const v = document.createElement('video'); v.src = url; v.controls = true; v.playsInline = true; v.preload = 'metadata';
       const r = document.createElement('div'); r.className = 'row';
-      const dl = document.createElement('button'); dl.textContent = 'Download MP4';
-      dl.addEventListener('click', () => { const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove(); });
-      const rm = document.createElement('button'); rm.className = 'sec'; rm.textContent = 'Remove';
-      rm.addEventListener('click', () => { URL.revokeObjectURL(url); el.remove(); });
+      const dl = document.createElement('button'); dl.textContent = 'Download';
+      dl.addEventListener('click', () => saveUrl(url, name));
       const inf = document.createElement('span'); inf.className = 'small'; inf.textContent = `${name} • ${info}`;
-      r.append(dl, rm, inf); res.append(v, r); res.hidden = false;
+      r.append(dl, inf); item.append(v, r); res.append(item); res.hidden = false;
+    };
+    job.complete = msg => {
+      cancel.hidden = true; job.setPct(100); job.setText(msg);
+      const r = document.createElement('div'); r.className = 'row';
+      if (results.length > 1) {
+        const all = document.createElement('button'); all.textContent = `Download all (${results.length})`;
+        all.addEventListener('click', async () => { for (const x of results) { saveUrl(x.url, x.name); await new Promise(ok => setTimeout(ok, 500)); } });
+        r.append(all);
+      }
+      const rm = document.createElement('button'); rm.className = 'sec'; rm.textContent = 'Remove job';
+      rm.addEventListener('click', () => { results.forEach(x => URL.revokeObjectURL(x.url)); el.remove(); });
+      r.append(rm); res.prepend(r); res.hidden = false;
     };
     job.fail = msg => { cancel.hidden = true; job.setPct(0); job.setText(msg); };
     job.setText('Waiting in queue…');
@@ -283,17 +313,22 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
       else { H = Number(job.res); W = Math.round(H * 16 / 9); }
       W -= W % 2; H -= H % 2;
       const vf = `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p`;
-      let list = '';
+      let list = '', curFile = null, curName = null, curAudio = false;
       for (let i = 0; i < job.clips.length; i++) {
         if (job.cancelled) throw new Error('Cancelled.');
         job.cur = i;
         const c = job.clips[i];
         const ext = (c.file.name.match(/\.[a-z0-9]+$/i) || ['.webm'])[0];
-        const inName = `j${job.id}_in${i}${ext}`, clipOut = `j${job.id}_c${i}.mp4`;
-        names.push(inName, clipOut);
+        const clipOut = `j${job.id}_c${i}.mp4`;
+        names.push(clipOut);
         job.setText(`Processing clip ${i + 1} of ${job.clips.length}…`);
-        await ffmpeg.writeFile(inName, await FFmpegUtil.fetchFile(c.file));
-        const audio = await hasAudio(inName);
+        if (c.file !== curFile) {   // write each source file once, even when it is split into many parts
+          if (curName) await rm(curName);
+          curName = `j${job.id}_in${i}${ext}`; names.push(curName);
+          await ffmpeg.writeFile(curName, await FFmpegUtil.fetchFile(c.file));
+          curAudio = await hasAudio(curName); curFile = c.file;
+        }
+        const inName = curName, audio = curAudio;
         const args = ['-ss', c.start.toFixed(3), '-i', inName];
         if (!audio) args.push('-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo');
         args.push('-t', (c.end - c.start).toFixed(3), '-map', '0:v:0', '-map', audio ? '0:a:0' : '1:a:0',
@@ -301,10 +336,14 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
           '-c:a', 'aac', '-b:a', '160k', '-ar', '44100', '-ac', '2', '-af', 'aresample=async=1',
           '-movflags', '+faststart', clipOut);
         const code = await ffmpeg.exec(args);
-        await rm(inName);
         if (code !== 0) throw new Error(`Clip ${i + 1} failed to convert.`);
-        list += `file '${clipOut}'\n`;
+        if (job.mode === 'separate') {
+          const d = await ffmpeg.readFile(clipOut); await rm(clipOut);
+          const nn = String(i + 1).padStart(2, '0');
+          job.addResult(new Blob([d.buffer], { type: 'video/mp4' }), `${c.file.name.replace(/\.[^.]+$/, '')}-part-${nn}.mp4`, `${fmt(c.start)}–${fmt(c.end)} • ${W}×${H}`);
+        } else list += `file '${clipOut}'\n`;
       }
+      if (job.mode === 'separate') { job.complete(`Done! ${job.clips.length} separate MP4 files are ready.`); return; }
       job.setText('Joining clips…'); job.setPct(96);
       const listName = `j${job.id}_list.txt`, outFile = `j${job.id}_out.mp4`;
       names.push(listName, outFile);
@@ -315,7 +354,8 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
       const blob = new Blob([data.buffer], { type: 'video/mp4' });
       const f = job.clips[0], base = f.file.name.replace(/\.[^.]+$/, '');
       const edited = job.clips.length > 1 || f.start > 0 || f.end < f.dur;
-      job.finish(blob, edited ? `${base}-edited.mp4` : `${base}.mp4`, `${(blob.size / 1048576).toFixed(1)} MB • ${W}×${H}`);
+      job.addResult(blob, edited ? `${base}-edited.mp4` : `${base}.mp4`, `${(blob.size / 1048576).toFixed(1)} MB • ${W}×${H}`);
+      job.complete('Done! Preview your MP4, then download it.');
     } catch (err) {
       job.fail(job.cancelled ? 'Cancelled.' : `Error: ${err.message || err}. For big files, try 480p or 720p, or cut the video into smaller parts.`);
     } finally {
@@ -328,7 +368,7 @@ select,input[type=text]{background:Canvas;color:CanvasText;border:1px solid var(
     if (!clips.length) return;
     const [preset, crf] = $('qual').value.split(',');
     const job = {
-      id: ++jobSeq, cancelled: false, cur: 0, preset, crf, res: $('res').value,
+      id: ++jobSeq, cancelled: false, cur: 0, preset, crf, res: $('res').value, mode: $('mode').value,
       clips: clips.map(c => ({ file: c.file, start: c.start, end: c.end, dur: c.dur, w: c.w, h: c.h }))
     };
     job.label = `Job ${job.id}: ${job.clips.length} clip(s), ${fmt(job.clips.reduce((a, c) => a + c.end - c.start, 0))}`;
